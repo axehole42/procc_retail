@@ -1,5 +1,31 @@
 -- ProcSounds - combat log parsing and alert cues (self-only)
 local ADDON_NAME = "ProcSounds"
+local Addon = ProcSoundsAddon or {}
+ProcSoundsAddon = Addon
+Addon.modules = Addon.modules or {}
+Addon.api = Addon.api or {}
+Addon.constants = Addon.constants or {}
+Addon.state = Addon.state or {}
+
+local API = Addon.api
+local UpdateSettingsFrame
+
+if not string.match then
+  string.match = function(s, pattern)
+    local results = { string.find(s, pattern) }
+    if not results[1] then
+      return nil
+    end
+    if results[3] ~= nil then
+      return unpack(results, 3)
+    end
+    return string.sub(s, results[1], results[2])
+  end
+end
+
+if not string.gmatch and string.gfind then
+  string.gmatch = string.gfind
+end
 
 local SOUND = {
   PROC         = "Interface\\AddOns\\ProcSounds\\Sounds\\proc.mp3",
@@ -86,21 +112,34 @@ local EXECUTE_REARM_PCT = 0.25
 local EXECUTE_CHECK_INTERVAL = 0.10
 local EXECUTE_CUE_ATTENTION_COOLDOWN = 5.00
 local EXECUTE_CUE_FADE_IN = 0.18
-local EXECUTE_CUE_PULSE_DURATION = 2.60
+local EXECUTE_CUE_PULSE_DURATION = 2.70
 local EXECUTE_CUE_DURATION = EXECUTE_CUE_FADE_IN + EXECUTE_CUE_PULSE_DURATION
 local EXECUTE_CUE_FADE_OUT = 0.40
 local EXECUTE_CUE_BASE_SCALE = 1.00
+local EXECUTE_CUE_FADE_IN_START_SCALE = 1.00
 local EXECUTE_CUE_PULSE_SCALE = 0.045
-local EXECUTE_CUE_PULSE_CYCLES = 2.0
+local EXECUTE_CUE_PULSE_COUNT = 3
+local EXECUTE_CUE_SCALE_DEFAULT = 1.00
+local EXECUTE_CUE_SCALE_MIN = 0.50
+local EXECUTE_CUE_SCALE_MAX = 2.00
+local EXECUTE_CUE_SCALE_STEP = 0.05
 local EXECUTE_ART_WIDTH = 128
 local EXECUTE_ART_HEIGHT = 256
 local EXECUTE_CUE_FRAME_WIDTH = EXECUTE_ART_WIDTH
 local EXECUTE_CUE_FRAME_HEIGHT = EXECUTE_ART_HEIGHT
 
+Addon.constants.Warrior = Addon.constants.Warrior or {}
+Addon.constants.Warrior.EXECUTE_TRIGGER_PCT = EXECUTE_TRIGGER_PCT
+Addon.constants.Warrior.EXECUTE_REARM_PCT = EXECUTE_REARM_PCT
+Addon.constants.Warrior.EXECUTE_CUE_ATTENTION_COOLDOWN = EXECUTE_CUE_ATTENTION_COOLDOWN
+
 local BUFF_SOUNDS = {
+  ["Cold Blood"]   = "COLDBLOOD",
+}
+
+local WARRIOR_BUFF_SOUNDS = {
   ["Death Wish"]   = "DEATHWISH",
   ["Recklessness"] = "RECKLESSNESS",
-  ["Cold Blood"]   = "COLDBLOOD",
 }
 
 ProcSounds_DB = ProcSounds_DB or ProcSoundTW_DB or {
@@ -116,7 +155,7 @@ ProcSounds_DB = ProcSounds_DB or ProcSoundTW_DB or {
   run_boxes = 0,
   run_copper = 0,
 
-  panel_shown = true,
+  panel_shown = false,
   panel_x = nil,
   panel_y = nil,
   settings_x = nil,
@@ -125,8 +164,11 @@ ProcSounds_DB = ProcSounds_DB or ProcSoundTW_DB or {
   execute_enabled = true,
   execute_x = nil,
   execute_y = nil,
+  execute_scale = EXECUTE_CUE_SCALE_DEFAULT,
 
+  debug_enabled = false,
   sound_choices = {},
+  sound_enabled = {},
 }
 
 -- Backfill defaults for older saved vars
@@ -139,8 +181,10 @@ ProcSounds_DB.run_start_epoch = ProcSounds_DB.run_start_epoch or 0
 ProcSounds_DB.run_elapsed     = ProcSounds_DB.run_elapsed     or 0
 ProcSounds_DB.run_boxes       = ProcSounds_DB.run_boxes       or 0
 ProcSounds_DB.run_copper      = ProcSounds_DB.run_copper      or 0
-ProcSounds_DB.panel_shown     = (ProcSounds_DB.panel_shown ~= false)
+ProcSounds_DB.panel_shown     = (ProcSounds_DB.panel_shown == true)
 ProcSounds_DB.execute_enabled = (ProcSounds_DB.execute_enabled ~= false)
+ProcSounds_DB.execute_scale   = tonumber(ProcSounds_DB.execute_scale) or EXECUTE_CUE_SCALE_DEFAULT
+ProcSounds_DB.debug_enabled   = (ProcSounds_DB.debug_enabled == true)
 -- Legacy execute sound/visual flags are intentionally ignored now.
 ProcSounds_DB.execute_sound   = true
 ProcSounds_DB.execute_visual  = true
@@ -153,8 +197,26 @@ local function EnsureSoundChoicesTable()
   return ProcSounds_DB.sound_choices
 end
 
+local function EnsureSoundEnabledTable()
+  if type(ProcSounds_DB.sound_enabled) ~= "table" then
+    ProcSounds_DB.sound_enabled = {}
+  end
+  return ProcSounds_DB.sound_enabled
+end
+
+local function IsSoundKeyEnabled(key)
+  local soundEnabled = EnsureSoundEnabledTable()
+  return soundEnabled[key] ~= false
+end
+
+local function SetSoundKeyEnabled(key, enabled)
+  local soundEnabled = EnsureSoundEnabledTable()
+  soundEnabled[key] = enabled and true or false
+end
+
 do
   local soundChoices = EnsureSoundChoicesTable()
+  local soundEnabled = EnsureSoundEnabledTable()
   local i
   for i = 1, table.getn(SOUND_ORDER) do
     local key = SOUND_ORDER[i]
@@ -162,10 +224,21 @@ do
     if options and options[1] and not soundChoices[key] then
       soundChoices[key] = options[1].id
     end
+    if soundEnabled[key] == nil then
+      soundEnabled[key] = true
+    end
   end
 end
 
 local lastFireAt = {}
+local warriorState = Addon.state.warrior or {
+  executeArmed = true,
+  executeTargetName = nil,
+  executeCueMoveMode = false,
+  lastExecuteTriggerAt = 0,
+  lastExecuteTriggerTarget = nil,
+}
+Addon.state.warrior = warriorState
 local bloodrageActive = false
 
 local JUNKBOX_STREAK_WINDOW = 15
@@ -187,16 +260,28 @@ local executeCueFadeOutAlpha = 1
 local executeCueFadeOutScale = 1
 local executeCuePhase = "hidden"
 local executeCheckAt = 0
-local executeArmed = true
-local executeTargetName = nil
-local executeCueMoveMode = false
-local lastExecuteTriggerAt = 0
-local lastExecuteTriggerTarget = nil
 
 local function Print(msg)
   if DEFAULT_CHAT_FRAME then
     DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99" .. ADDON_NAME .. "|r " .. msg)
   end
+end
+
+local function PrintDebug(msg)
+  if ProcSounds_DB and ProcSounds_DB.debug_enabled then
+    Print("|cffffff66DEBUG|r " .. msg)
+  end
+end
+
+local function DebugChatEvent(eventName, msg)
+  if not ProcSounds_DB or not ProcSounds_DB.debug_enabled then
+    return
+  end
+  if not eventName or not string.find(eventName, "^CHAT_MSG_") then
+    return
+  end
+
+  PrintDebug("[" .. eventName .. "] " .. tostring(msg or ""))
 end
 
 local function FireOnce(key, minInterval)
@@ -208,6 +293,8 @@ local function FireOnce(key, minInterval)
   lastFireAt[key] = now
   return true
 end
+
+API.FireOnce = FireOnce
 
 local function Play(path)
   PlaySoundFile(path)
@@ -234,12 +321,24 @@ local function GetSelectedSoundOption(key)
   return options[1], 1
 end
 
-local function PlaySoundKey(key)
+local function PlaySoundKey(key, bypassEnabled)
   local option = GetSelectedSoundOption(key)
+  local enabled = IsSoundKeyEnabled(key)
+
+  if not bypassEnabled and not enabled then
+    PrintDebug("PlaySoundKey blocked: " .. tostring(key) .. " (disabled)")
+    return
+  end
+
   if option and option.path then
+    PrintDebug("PlaySoundKey: " .. tostring(key) .. " -> " .. tostring(option.path))
     Play(option.path)
+  else
+    PrintDebug("PlaySoundKey missing option/path: " .. tostring(key))
   end
 end
+
+API.PlaySoundKey = PlaySoundKey
 
 local function CycleSoundOption(key, step)
   local options = SOUND_OPTIONS[key]
@@ -299,12 +398,26 @@ local function ResetJunkboxStreak()
   lastJunkboxAt = 0
 end
 
+local function GetWarriorModule()
+  return Addon.modules and Addon.modules.Warrior
+end
+
 local function IsWarriorPlayer()
+  local warrior = GetWarriorModule()
+  if warrior and warrior.IsWarriorPlayer then
+    return warrior.IsWarriorPlayer()
+  end
+
   local localizedClass, englishClass = UnitClass("player")
   return englishClass == "WARRIOR" or englishClass == "Warrior" or localizedClass == "Warrior"
 end
 
 local function GetTargetHealthPercent()
+  local warrior = GetWarriorModule()
+  if warrior and warrior.GetTargetHealthPercent then
+    return warrior.GetTargetHealthPercent()
+  end
+
   if not UnitExists("target") then
     return nil, nil, nil
   end
@@ -319,8 +432,58 @@ local function GetTargetHealthPercent()
 end
 
 local function ResetExecuteState()
-  executeTargetName = UnitName("target")
-  executeArmed = true
+  local warrior = GetWarriorModule()
+  if warrior and warrior.ResetExecuteState then
+    warrior.ResetExecuteState()
+    return
+  end
+
+  warriorState.executeTargetName = UnitName("target")
+  warriorState.executeArmed = true
+end
+
+API.GetWarriorState = function()
+  return warriorState
+end
+
+local function SanitizeExecuteCueScale(scale)
+  scale = tonumber(scale) or EXECUTE_CUE_SCALE_DEFAULT
+  if scale < EXECUTE_CUE_SCALE_MIN then
+    scale = EXECUTE_CUE_SCALE_MIN
+  elseif scale > EXECUTE_CUE_SCALE_MAX then
+    scale = EXECUTE_CUE_SCALE_MAX
+  end
+  return math.floor((scale * 100) + 0.5) / 100
+end
+
+local function GetExecuteCueBaseScale()
+  ProcSounds_DB.execute_scale = SanitizeExecuteCueScale(ProcSounds_DB.execute_scale)
+  return EXECUTE_CUE_BASE_SCALE * ProcSounds_DB.execute_scale
+end
+
+local function GetExecuteCueScalePercentText()
+  return string.format("%d%%", math.floor((SanitizeExecuteCueScale(ProcSounds_DB.execute_scale) * 100) + 0.5))
+end
+
+local function RefreshExecuteCueScale()
+  if not executeCueFrame then return end
+  if executeCuePhase == "fadeout" then return end
+  executeCueFrame:SetScale(GetExecuteCueBaseScale())
+end
+
+local function SetExecuteCueScale(scale, silent)
+  ProcSounds_DB.execute_scale = SanitizeExecuteCueScale(scale)
+  RefreshExecuteCueScale()
+  if UpdateSettingsFrame then
+    UpdateSettingsFrame()
+  end
+  if not silent then
+    Print("Execute cue size: " .. GetExecuteCueScalePercentText() .. ".")
+  end
+end
+
+local function AdjustExecuteCueScale(delta, silent)
+  SetExecuteCueScale((ProcSounds_DB.execute_scale or EXECUTE_CUE_SCALE_DEFAULT) + delta, silent)
 end
 
 local function SaveExecuteCuePosition()
@@ -342,6 +505,14 @@ local function ApplyExecuteCuePosition()
   end
 end
 
+local function ApplyExecuteCueTransform(scale)
+  if not executeCueFrame then return end
+  executeCueFrame:SetScale(scale)
+  if not warriorState.executeCueMoveMode then
+    ApplyExecuteCuePosition()
+  end
+end
+
 local function HideExecuteCue(force)
   executeCueUntil = 0
   executeCueStartAt = 0
@@ -350,9 +521,9 @@ local function HideExecuteCue(force)
   executeCueFadeOutScale = 1
   executeCuePhase = "hidden"
   if executeCueFrame then
-    executeCueFrame:SetScale(1)
+    ApplyExecuteCueTransform(GetExecuteCueBaseScale())
     executeCueFrame:SetAlpha(1)
-    if executeCueMoveMode and not force then
+    if warriorState.executeCueMoveMode and not force then
       return
     end
     executeCueFrame:Hide()
@@ -371,7 +542,7 @@ local function EnsureExecuteCueFrame()
   executeCueFrame:SetMovable(true)
   executeCueFrame:RegisterForDrag("LeftButton")
   executeCueFrame:SetScript("OnDragStart", function()
-    if executeCueMoveMode then
+    if warriorState.executeCueMoveMode then
       executeCueFrame:StartMoving()
     end
   end)
@@ -395,21 +566,21 @@ local function SetExecuteCueText(title, subText)
 end
 
 local function UnlockVisuals(silent)
-  executeCueMoveMode = true
+  warriorState.executeCueMoveMode = true
   EnsureExecuteCueFrame()
   executeCueFrame:SetAlpha(1)
-  executeCueFrame:SetScale(1)
+  ApplyExecuteCueTransform(GetExecuteCueBaseScale())
   executeCueFrame:Show()
   if UpdateSettingsFrame then
     UpdateSettingsFrame()
   end
   if not silent then
-    Print("Visuals unlocked. Drag the execute cue, then run /psounds visuals lock.")
+    Print("Visuals unlocked. Drag the execute cue, then run /ps visuals lock.")
   end
 end
 
 local function LockVisuals(silent)
-  executeCueMoveMode = false
+  warriorState.executeCueMoveMode = false
   HideExecuteCue(true)
   if UpdateSettingsFrame then
     UpdateSettingsFrame()
@@ -420,23 +591,24 @@ local function LockVisuals(silent)
 end
 
 local function ToggleExecuteCueMover()
-  if executeCueMoveMode then
+  if warriorState.executeCueMoveMode then
     LockVisuals(true)
-    Print("Execute cue locked. Use /psounds visuals unlock next time.")
+    Print("Execute cue locked. Use /ps visuals unlock next time.")
     return
   end
 
   UnlockVisuals(true)
-  Print("Execute cue unlocked. Drag it, then run /psounds visuals lock.")
+  Print("Execute cue unlocked. Drag it, then run /ps visuals lock.")
 end
 
 local function PrintVisualsStatus()
-  Print("Visuals: " .. (executeCueMoveMode and "UNLOCKED" or "LOCKED") ..
+  Print("Visuals: " .. (warriorState.executeCueMoveMode and "UNLOCKED" or "LOCKED") ..
+    " | Size: " .. GetExecuteCueScalePercentText() ..
     " | Movable now: execute cue")
 end
 
 local function BeginExecuteCueFadeOut()
-  if executeCueMoveMode then
+  if warriorState.executeCueMoveMode then
     return
   end
 
@@ -455,13 +627,23 @@ local function BeginExecuteCueFadeOut()
   executeCueFadeOutScale = executeCueFrame:GetScale() or 1
 end
 
+API.BeginExecuteCueFadeOut = BeginExecuteCueFadeOut
+API.IsExecuteCueShown = function()
+  return executeCueFrame and executeCueFrame:IsShown()
+end
+
 local function TriggerExecuteCue(title, subText, withAttention)
+  local baseScale = GetExecuteCueBaseScale()
+
   if withAttention == nil then
     withAttention = true
   end
 
-  lastExecuteTriggerAt = GetTime()
-  lastExecuteTriggerTarget = UnitName("target")
+  warriorState.lastExecuteTriggerAt = GetTime()
+  warriorState.lastExecuteTriggerTarget = UnitName("target")
+  PrintDebug("Trigger execute cue" ..
+    ((warriorState.lastExecuteTriggerTarget and warriorState.lastExecuteTriggerTarget ~= "") and
+      (" for " .. warriorState.lastExecuteTriggerTarget) or ""))
 
   if withAttention then
     PlaySoundKey("EXECUTE")
@@ -475,34 +657,36 @@ local function TriggerExecuteCue(title, subText, withAttention)
     executeCueUntil = executeCueStartAt + EXECUTE_CUE_DURATION
     executeCuePhase = "pulse"
     executeCueFrame:SetAlpha(0)
-    executeCueFrame:SetScale(EXECUTE_CUE_BASE_SCALE)
+    ApplyExecuteCueTransform(baseScale * EXECUTE_CUE_FADE_IN_START_SCALE)
   else
     executeCueUntil = 0
     executeCuePhase = "steady"
     executeCueFrame:SetAlpha(1)
-    executeCueFrame:SetScale(EXECUTE_CUE_BASE_SCALE)
+    ApplyExecuteCueTransform(baseScale)
   end
 
   executeCueFrame:Show()
 end
+
+API.TriggerExecuteCue = TriggerExecuteCue
 
 local function UpdateExecuteCue()
   if not executeCueFrame or not executeCueFrame:IsShown() then
     return
   end
 
-  if executeCueMoveMode then
+  if warriorState.executeCueMoveMode then
     executeCueFrame:SetAlpha(1)
-    executeCueFrame:SetScale(1)
+    ApplyExecuteCueTransform(GetExecuteCueBaseScale())
     return
   end
 
   local now = GetTime()
+  local baseScale = GetExecuteCueBaseScale()
   local elapsed
   local pulseElapsed
   local pulseProgress
   local pulse
-  local damping
 
   if executeCuePhase == "fadeout" then
     local fadeProgress
@@ -518,7 +702,7 @@ local function UpdateExecuteCue()
     end
 
     executeCueFrame:SetAlpha(executeCueFadeOutAlpha * (1 - fadeProgress))
-    executeCueFrame:SetScale(executeCueFadeOutScale)
+    ApplyExecuteCueTransform(executeCueFadeOutScale)
     return
   end
 
@@ -530,7 +714,7 @@ local function UpdateExecuteCue()
   if elapsed <= EXECUTE_CUE_FADE_IN then
     local progress = elapsed / EXECUTE_CUE_FADE_IN
     executeCueFrame:SetAlpha(progress)
-    executeCueFrame:SetScale(EXECUTE_CUE_BASE_SCALE)
+    ApplyExecuteCueTransform(baseScale * (EXECUTE_CUE_FADE_IN_START_SCALE + ((1 - EXECUTE_CUE_FADE_IN_START_SCALE) * progress)))
     return
   end
 
@@ -540,17 +724,16 @@ local function UpdateExecuteCue()
     if pulseProgress < 0 then pulseProgress = 0 end
     if pulseProgress > 1 then pulseProgress = 1 end
 
-    -- Two slower outward swells that decay before settling to the base scale.
-    pulse = 0.5 - (0.5 * math.cos(pulseProgress * EXECUTE_CUE_PULSE_CYCLES * 6.2831853))
-    damping = 1 - (0.35 * pulseProgress)
+    -- Three outward pulses that return to the base scale between peaks.
+    pulse = 0.5 - (0.5 * math.cos(pulseProgress * EXECUTE_CUE_PULSE_COUNT * 6.2831853))
     executeCueFrame:SetAlpha(1)
-    executeCueFrame:SetScale(EXECUTE_CUE_BASE_SCALE + (EXECUTE_CUE_PULSE_SCALE * pulse * damping))
+    ApplyExecuteCueTransform(baseScale * (1 + (EXECUTE_CUE_PULSE_SCALE * pulse)))
     return
   end
 
   executeCuePhase = "steady"
   executeCueFrame:SetAlpha(1)
-  executeCueFrame:SetScale(EXECUTE_CUE_BASE_SCALE)
+  ApplyExecuteCueTransform(baseScale)
 end
 
 local function CanWatchExecute()
@@ -558,7 +741,7 @@ local function CanWatchExecute()
     return false
   end
 
-  if executeCueMoveMode then
+  if warriorState.executeCueMoveMode then
     return false
   end
 
@@ -570,8 +753,6 @@ local function CanWatchExecute()
     return false
   end
 
-  -- Some clients report attackability unreliably, so
-  -- only block obvious friendly targets here.
   if UnitIsFriend and UnitIsFriend("player", "target") then
     return false
   end
@@ -581,16 +762,16 @@ end
 
 local function CheckExecutePhase()
   local targetName = UnitName("target")
-  if targetName ~= executeTargetName then
-    if executeTargetName and executeCueFrame and executeCueFrame:IsShown() then
+  if targetName ~= warriorState.executeTargetName then
+    if warriorState.executeTargetName and executeCueFrame and executeCueFrame:IsShown() then
       BeginExecuteCueFadeOut()
     end
-    executeTargetName = targetName
-    executeArmed = true
+    warriorState.executeTargetName = targetName
+    warriorState.executeArmed = true
   end
 
   if not CanWatchExecute() then
-    if not executeCueMoveMode then
+    if not warriorState.executeCueMoveMode then
       BeginExecuteCueFadeOut()
     end
     return
@@ -603,16 +784,16 @@ local function CheckExecutePhase()
 
   local health = UnitHealth("target") or 0
   if health <= 0 then
-    executeArmed = true
+    warriorState.executeArmed = true
     BeginExecuteCueFadeOut()
     return
   end
 
   local healthPct = health / healthMax
   if healthPct <= EXECUTE_TRIGGER_PCT then
-    if executeArmed then
+    if warriorState.executeArmed then
       local withAttention = FireOnce("execute:range:attention", EXECUTE_CUE_ATTENTION_COOLDOWN)
-      executeArmed = false
+      warriorState.executeArmed = false
       if UnitName("target") and UnitName("target") ~= "" then
         TriggerExecuteCue("EXECUTE", UnitName("target") .. " is in execute range", withAttention)
       else
@@ -620,7 +801,7 @@ local function CheckExecutePhase()
       end
     end
   elseif healthPct >= EXECUTE_REARM_PCT then
-    executeArmed = true
+    warriorState.executeArmed = true
   end
 end
 
@@ -690,7 +871,6 @@ end
 
 local copyFrame = nil
 local settingsFrame = nil
-local UpdateSettingsFrame
 local SetPanelShown
 
 local function MakeRunCSVLine()
@@ -798,6 +978,7 @@ local function EnsureSettingsFrame()
   local soundPrevX = 350
   local soundNextX = 380
   local soundTestX = 414
+  local soundEnabledX = 476
 
   if settingsFrame then return end
 
@@ -856,7 +1037,7 @@ local function EnsureSettingsFrame()
         ProcSounds_DB.execute_enabled = true
         ResetExecuteState()
       else
-        executeCueMoveMode = false
+        warriorState.executeCueMoveMode = false
         HideExecuteCue(true)
       end
       if UpdateSettingsFrame then UpdateSettingsFrame() end
@@ -874,7 +1055,7 @@ local function EnsureSettingsFrame()
       if ProcSounds_DB.execute_enabled then
         ResetExecuteState()
       else
-        executeCueMoveMode = false
+        warriorState.executeCueMoveMode = false
         HideExecuteCue(true)
       end
       if UpdateSettingsFrame then UpdateSettingsFrame() end
@@ -910,7 +1091,7 @@ local function EnsureSettingsFrame()
   settingsFrame.visualsBtn:SetHeight(22)
   settingsFrame.visualsBtn:SetPoint("LEFT", settingsFrame.testExecuteBtn, "RIGHT", 10, 0)
   settingsFrame.visualsBtn:SetScript("OnClick", function()
-    if executeCueMoveMode then
+    if warriorState.executeCueMoveMode then
       LockVisuals()
     else
       UnlockVisuals()
@@ -927,6 +1108,33 @@ local function EnsureSettingsFrame()
     ShowCopy()
   end)
 
+  settingsFrame.visualSizeLabel = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  settingsFrame.visualSizeLabel:SetPoint("LEFT", settingsFrame.copyBtn, "RIGHT", 12, 0)
+  settingsFrame.visualSizeLabel:SetText("Size")
+
+  settingsFrame.visualSmallerBtn = CreateFrame("Button", nil, settingsFrame, "UIPanelButtonTemplate")
+  settingsFrame.visualSmallerBtn:SetWidth(24)
+  settingsFrame.visualSmallerBtn:SetHeight(22)
+  settingsFrame.visualSmallerBtn:SetPoint("LEFT", settingsFrame.visualSizeLabel, "RIGHT", 6, 0)
+  settingsFrame.visualSmallerBtn:SetText("<")
+  settingsFrame.visualSmallerBtn:SetScript("OnClick", function()
+    AdjustExecuteCueScale(-EXECUTE_CUE_SCALE_STEP)
+  end)
+
+  settingsFrame.visualSizeValue = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  settingsFrame.visualSizeValue:SetWidth(46)
+  settingsFrame.visualSizeValue:SetJustifyH("CENTER")
+  settingsFrame.visualSizeValue:SetPoint("LEFT", settingsFrame.visualSmallerBtn, "RIGHT", 6, 0)
+
+  settingsFrame.visualLargerBtn = CreateFrame("Button", nil, settingsFrame, "UIPanelButtonTemplate")
+  settingsFrame.visualLargerBtn:SetWidth(24)
+  settingsFrame.visualLargerBtn:SetHeight(22)
+  settingsFrame.visualLargerBtn:SetPoint("LEFT", settingsFrame.visualSizeValue, "RIGHT", 6, 0)
+  settingsFrame.visualLargerBtn:SetText(">")
+  settingsFrame.visualLargerBtn:SetScript("OnClick", function()
+    AdjustExecuteCueScale(EXECUTE_CUE_SCALE_STEP)
+  end)
+
   local soundsLabel = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
   soundsLabel:SetPoint("TOPLEFT", settingsFrame, "TOPLEFT", 16, -186)
   soundsLabel:SetText("Sounds")
@@ -938,6 +1146,10 @@ local function EnsureSettingsFrame()
   local soundSelectedHeader = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
   soundSelectedHeader:SetPoint("TOPLEFT", settingsFrame, "TOPLEFT", soundValueX, -206)
   soundSelectedHeader:SetText("Selected")
+
+  local soundEnabledHeader = settingsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  soundEnabledHeader:SetPoint("TOPLEFT", settingsFrame, "TOPLEFT", soundEnabledX, -206)
+  soundEnabledHeader:SetText("On")
 
   settingsFrame.soundRows = {}
   y = -228
@@ -985,7 +1197,14 @@ local function EnsureSettingsFrame()
     row.testBtn:SetPoint("TOPLEFT", settingsFrame, "TOPLEFT", soundTestX, y + 2)
     row.testBtn:SetText("Test")
     row.testBtn:SetScript("OnClick", function()
-      PlaySoundKey(key)
+      PlaySoundKey(key, true)
+    end)
+
+    row.enabledCheck = CreateFrame("CheckButton", "ProcSounds_SettingsSoundEnabled_" .. key, settingsFrame, "UICheckButtonTemplate")
+    row.enabledCheck:SetPoint("TOPLEFT", settingsFrame, "TOPLEFT", soundEnabledX, y + 1)
+    row.enabledCheck:SetScript("OnClick", function()
+      SetSoundKeyEnabled(key, row.enabledCheck:GetChecked() and true or false)
+      if UpdateSettingsFrame then UpdateSettingsFrame() end
     end)
 
     settingsFrame.soundRows[key] = row
@@ -1015,10 +1234,22 @@ function UpdateSettingsFrame()
   settingsFrame.executeCheck:SetChecked(ProcSounds_DB.execute_enabled and 1 or nil)
   settingsFrame.panelCheck:SetChecked(ProcSounds_DB.panel_shown and 1 or nil)
 
-  if executeCueMoveMode then
+  if warriorState.executeCueMoveMode then
     settingsFrame.visualsBtn:SetText("Lock Visual")
   else
     settingsFrame.visualsBtn:SetText("Unlock Visual")
+  end
+
+  settingsFrame.visualSizeValue:SetText(GetExecuteCueScalePercentText())
+  if SanitizeExecuteCueScale(ProcSounds_DB.execute_scale) <= EXECUTE_CUE_SCALE_MIN then
+    settingsFrame.visualSmallerBtn:Disable()
+  else
+    settingsFrame.visualSmallerBtn:Enable()
+  end
+  if SanitizeExecuteCueScale(ProcSounds_DB.execute_scale) >= EXECUTE_CUE_SCALE_MAX then
+    settingsFrame.visualLargerBtn:Disable()
+  else
+    settingsFrame.visualLargerBtn:Enable()
   end
 
   for i = 1, table.getn(SOUND_ORDER) do
@@ -1026,9 +1257,18 @@ function UpdateSettingsFrame()
     local row = settingsFrame.soundRows[key]
     local option = GetSelectedSoundOption(key)
     local count = table.getn(SOUND_OPTIONS[key] or {})
+    local enabled = IsSoundKeyEnabled(key)
 
     if row and option then
       row.value:SetText(option.label)
+      row.enabledCheck:SetChecked(enabled and 1 or nil)
+      if enabled then
+        row.label:SetTextColor(1.0, 0.82, 0.0)
+        row.value:SetTextColor(1.0, 0.82, 0.0)
+      else
+        row.label:SetTextColor(0.55, 0.55, 0.55)
+        row.value:SetTextColor(0.55, 0.55, 0.55)
+      end
       if count <= 1 then
         row.prevBtn:Disable()
         row.nextBtn:Disable()
@@ -1064,6 +1304,8 @@ local function ExtractBuffName(msg)
   return nil
 end
 
+API.ExtractBuffName = ExtractBuffName
+
 local function IsSuccessfulExecuteMessage(msg)
   if not msg or not string.find(msg, "Execute") then
     return false
@@ -1073,6 +1315,43 @@ local function IsSuccessfulExecuteMessage(msg)
     if string.find(msg, " hits ") or string.find(msg, " crits ") then
       return true
     end
+  end
+
+  return false
+end
+
+local function HandleWarriorMessage(msg)
+  if string.match(msg, "^Bloodrage fades from you%.$") then
+    bloodrageActive = false
+    PrintDebug("Matched warrior bloodrage fade")
+    return true
+  end
+
+  if IsSuccessfulExecuteMessage(msg) then
+    if FireOnce("spell:ExecuteSuccess", 0.05) then
+      PlaySoundKey("EXECUTE_EFFECT")
+    end
+    PrintDebug("Matched warrior execute hit")
+    return true
+  end
+
+  local rageSource = string.match(msg, "^You gain %d+ Rage from (.+)%.$")
+  if rageSource == "Bloodrage" then
+    if not bloodrageActive then
+      bloodrageActive = true
+      PlaySoundKey("BLOODRAGE")
+    end
+    PrintDebug("Matched warrior bloodrage start")
+    return true
+  end
+
+  local buff = ExtractBuffName(msg)
+  if buff and WARRIOR_BUFF_SOUNDS[buff] then
+    if FireOnce("buff:" .. buff, 0.50) then
+      PlaySoundKey(WARRIOR_BUFF_SOUNDS[buff])
+    end
+    PrintDebug("Matched warrior buff: " .. buff)
+    return true
   end
 
   return false
@@ -1240,13 +1519,13 @@ SetPanelShown = function(shown, chatFeedback)
     ProcSounds_DB.panel_shown = true
     UpdatePanelText()
     if chatFeedback then
-      Print("Loot panel: shown. (/psounds lp)")
+      Print("Loot panel: shown. (/ps lp)")
     end
   else
     panel:Hide()
     ProcSounds_DB.panel_shown = false
     if chatFeedback then
-      Print("Loot panel: hidden. (/psounds lp)")
+      Print("Loot panel: hidden. (/ps lp)")
     end
   end
 
@@ -1283,6 +1562,8 @@ local function OnHeavyJunkboxLoot()
     PlaySoundKey("JACKPOT")
     ResetJunkboxStreak()
   end
+
+  PrintDebug("Matched Heavy Junkbox loot")
 
   UpdatePanelText()
 end
@@ -1322,18 +1603,6 @@ local function HandleMessage(msg)
     ResetJunkboxStreak()
   end
 
-  if string.match(msg, "^Bloodrage fades from you%.$") then
-    bloodrageActive = false
-    return
-  end
-
-  if IsSuccessfulExecuteMessage(msg) then
-    if FireOnce("spell:ExecuteSuccess", 0.05) then
-      PlaySoundKey("EXECUTE_EFFECT")
-    end
-    return
-  end
-
   if string.find(msg, "^You receive loot:") or string.find(msg, "^You receive item:") then
     if string.find(msg, "%[Heavy Junkbox%]") or string.find(msg, "Heavy Junkbox") then
       if FireOnce("loot:Heavy Junkbox", 0.30) then
@@ -1357,15 +1626,11 @@ local function HandleMessage(msg)
     if FireOnce("extra:" .. source, 0.20) then
       PlaySoundKey("PROC")
     end
+    PrintDebug("Matched extra attack proc: " .. source)
     return
   end
 
-  local rageSource = string.match(msg, "^You gain %d+ Rage from (.+)%.$")
-  if rageSource == "Bloodrage" then
-    if not bloodrageActive then
-      bloodrageActive = true
-      PlaySoundKey("BLOODRAGE")
-    end
+  if HandleWarriorMessage(msg) then
     return
   end
 
@@ -1374,6 +1639,7 @@ local function HandleMessage(msg)
     if FireOnce("buff:" .. buff, 0.50) then
       PlaySoundKey(BUFF_SOUNDS[buff])
     end
+    PrintDebug("Matched buff: " .. buff)
     return
   end
 end
@@ -1421,13 +1687,15 @@ f:SetScript("OnEvent", function()
 
   if (event == "PLAYER_LOGIN" or event == "PLAYER_ENTERING_WORLD") and not printedLoaded then
     printedLoaded = true
-    Print("Loaded. Status: " .. (ProcSounds_DB.enabled and "ON" or "OFF") .. "  (/psounds)")
-    CreatePanel()
-    if not ProcSounds_DB.panel_shown and panel then panel:Hide() end
-    UpdatePanelText()
+    Print("Loaded. Status: " .. (ProcSounds_DB.enabled and "ON" or "OFF") .. "  (/ps)")
+    if ProcSounds_DB.panel_shown then
+      CreatePanel()
+      UpdatePanelText()
+    end
     return
   end
 
+  DebugChatEvent(event, arg1)
   HandleMessage(arg1)
 end)
 
@@ -1435,23 +1703,42 @@ end)
 
 local function PrintHelp()
   Print("Commands:")
-  Print("  /psounds on|off|status")
-  Print("  /psounds execute on|off|status|move|test")
-  Print("  /psounds settings")
-  Print("  /psounds visuals unlock|lock|status")
-  Print("  /psounds lp      - toggle loot panel")
-  Print("  /psounds run start|pause|resume|reset|status")
-  Print("  /psounds copy    - open CSV copy window (SHIFT = header)")
+  Print("  /ps on|off|status")
+  Print("  /ps debug on|off|status")
+  Print("  /ps execute on|off|status|move|test")
+  Print("  /ps settings")
+  Print("  /ps visuals unlock|lock|status|smaller|larger|reset|size <percent>")
+  Print("  /ps lp      - toggle loot panel")
+  Print("  /ps run start|pause|resume|reset|status")
+  Print("  /ps copy    - open CSV copy window (SHIFT = header)")
 end
 
-SLASH_PROCSOUNDS1 = "/psounds"
-SLASH_PROCSOUNDS2 = "/pstw"
+local function SplitArgs(text)
+  local args = {}
+  local searchStart = 1
+
+  while true do
+    local wordStart, wordEnd = string.find(text, "%S+", searchStart)
+    if not wordStart then
+      break
+    end
+
+    table.insert(args, string.sub(text, wordStart, wordEnd))
+    searchStart = wordEnd + 1
+  end
+
+  return args
+end
+
+SLASH_PROCSOUNDS1 = "/ps"
+SLASH_PROCSOUNDS2 = "/psounds"
 SlashCmdList["PROCSOUNDS"] = function(cmd)
   cmd = cmd or ""
-  local args = {}
-  for w in string.gmatch(cmd, "%S+") do table.insert(args, w) end
+  local args = SplitArgs(cmd)
+  local scaleValue
   local a1 = string.lower(args[1] or "")
   local a2 = string.lower(args[2] or "")
+  local a3 = args[3] or ""
 
   if a1 == "on" then
     ProcSounds_DB.enabled = true
@@ -1462,7 +1749,7 @@ SlashCmdList["PROCSOUNDS"] = function(cmd)
     Print("Enabled. All features are on.")
   elseif a1 == "off" then
     ProcSounds_DB.enabled = false
-    executeCueMoveMode = false
+    warriorState.executeCueMoveMode = false
     HideExecuteCue(true)
     if UpdateSettingsFrame then UpdateSettingsFrame() end
     Print("Disabled. All features are off.")
@@ -1470,7 +1757,20 @@ SlashCmdList["PROCSOUNDS"] = function(cmd)
     Print("Status: " .. (ProcSounds_DB.enabled and "ON" or "OFF") ..
       " | Lifetime boxes: " .. tostring(ProcSounds_DB.lifetime_boxes or 0) ..
       " | Lifetime gold: " .. FormatMoneyCopper(ProcSounds_DB.lifetime_copper or 0) ..
-      " | Execute cue: " .. (ProcSounds_DB.execute_enabled and "ON" or "OFF"))
+      " | Execute cue: " .. (ProcSounds_DB.execute_enabled and "ON" or "OFF") ..
+      " | Debug: " .. (ProcSounds_DB.debug_enabled and "ON" or "OFF") ..
+      " | Visual size: " .. GetExecuteCueScalePercentText())
+  elseif a1 == "debug" then
+    if a2 == "on" then
+      ProcSounds_DB.debug_enabled = true
+      Print("Debug enabled. Use an ability and watch for DEBUG lines in chat.")
+    elseif a2 == "off" then
+      ProcSounds_DB.debug_enabled = false
+      Print("Debug disabled.")
+    else
+      Print("Debug: " .. (ProcSounds_DB.debug_enabled and "ON" or "OFF") ..
+        " | Usage: /ps debug on|off|status")
+    end
   elseif a1 == "settings" then
     ToggleSettings()
   elseif a1 == "visuals" then
@@ -1478,6 +1778,22 @@ SlashCmdList["PROCSOUNDS"] = function(cmd)
       UnlockVisuals()
     elseif a2 == "lock" then
       LockVisuals()
+    elseif a2 == "smaller" then
+      AdjustExecuteCueScale(-EXECUTE_CUE_SCALE_STEP)
+    elseif a2 == "larger" then
+      AdjustExecuteCueScale(EXECUTE_CUE_SCALE_STEP)
+    elseif a2 == "reset" then
+      SetExecuteCueScale(EXECUTE_CUE_SCALE_DEFAULT)
+    elseif a2 == "size" then
+      scaleValue = tonumber(a3)
+      if not scaleValue then
+        Print("Usage: /ps visuals size <percent or scale>")
+      else
+        if scaleValue > 10 then
+          scaleValue = scaleValue / 100
+        end
+        SetExecuteCueScale(scaleValue)
+      end
     else
       PrintVisualsStatus()
     end
@@ -1489,15 +1805,15 @@ SlashCmdList["PROCSOUNDS"] = function(cmd)
       Print("Execute cue enabled.")
     elseif a2 == "off" then
       ProcSounds_DB.execute_enabled = false
-      executeCueMoveMode = false
+      warriorState.executeCueMoveMode = false
       HideExecuteCue(true)
       if UpdateSettingsFrame then UpdateSettingsFrame() end
       Print("Execute cue disabled.")
     elseif a2 == "move" then
       ToggleExecuteCueMover()
     elseif a2 == "test" then
-      if executeCueMoveMode then
-        Print("Lock the visuals first. (/psounds visuals lock)")
+      if warriorState.executeCueMoveMode then
+        Print("Lock the visuals first. (/ps visuals lock)")
       else
         TriggerExecuteCue("EXECUTE", "Preview: pulse + sound", true)
       end
@@ -1511,20 +1827,21 @@ SlashCmdList["PROCSOUNDS"] = function(cmd)
       end
 
       local lastTriggerInfo = " | Last trigger: never"
-      if lastExecuteTriggerAt > 0 then
-        local age = GetTime() - lastExecuteTriggerAt
+      if warriorState.lastExecuteTriggerAt > 0 then
+        local age = GetTime() - warriorState.lastExecuteTriggerAt
         if age < 0 then age = 0 end
         lastTriggerInfo = string.format(" | Last trigger: %.1fs ago%s",
           age,
-          (lastExecuteTriggerTarget and lastExecuteTriggerTarget ~= "" and (" (" .. lastExecuteTriggerTarget .. ")") or ""))
+          (warriorState.lastExecuteTriggerTarget and warriorState.lastExecuteTriggerTarget ~= "" and (" (" .. warriorState.lastExecuteTriggerTarget .. ")") or ""))
       end
 
       Print("Execute cue: " .. (ProcSounds_DB.execute_enabled and "ON" or "OFF") ..
         " | Class: " .. (IsWarriorPlayer() and "WARRIOR" or "NON-WARRIOR") ..
         " | Trigger: <= 20% target HP" ..
         " | Watch: " .. (CanWatchExecute() and "READY" or "BLOCKED") ..
-        " | Visuals: " .. (executeCueMoveMode and "UNLOCKED" or "LOCKED") ..
-        " | Armed: " .. (executeArmed and "YES" or "NO") ..
+        " | Visuals: " .. (warriorState.executeCueMoveMode and "UNLOCKED" or "LOCKED") ..
+        " | Size: " .. GetExecuteCueScalePercentText() ..
+        " | Armed: " .. (warriorState.executeArmed and "YES" or "NO") ..
         " | Cue: ON" ..
         targetInfo ..
         lastTriggerInfo)
@@ -1558,7 +1875,7 @@ SlashCmdList["PROCSOUNDS"] = function(cmd)
         (ProcSounds_DB.run_active and elapsed > 0 and string.format(" | GPH: %.2f", gph) or " | GPH: -")
       )
     else
-      Print("Usage: /psounds run start|pause|resume|reset|status")
+      Print("Usage: /ps run start|pause|resume|reset|status")
     end
   elseif a1 == "copy" then
     ShowCopy()
